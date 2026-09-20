@@ -1,16 +1,23 @@
 import os
-import time
+import json
+import re
 import threading
+import time
 
 import numpy as np
 from flask import Flask, request, jsonify
 
 
 # ============================================================
-# CONFIG
+# Configuration
 # ============================================================
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "model.npz")
+MODEL_FILE = os.environ.get(
+    "MODEL_FILE",
+    "tiny_gpt_pc.npz"
+)
+
+MAX_PROMPT_CHARS = 8000
 
 DEFAULT_TEMPERATURE = 0.75
 DEFAULT_TOP_K = 30
@@ -18,169 +25,338 @@ DEFAULT_TOP_P = 0.90
 DEFAULT_REPETITION_PENALTY = 1.05
 DEFAULT_MAX_NEW_TOKENS = 60
 
-MAX_ALLOWED_TOKENS = 180
+MAX_NEW_TOKENS_LIMIT = 180
 
 MODEL_LOCK = threading.Lock()
 
 
 # ============================================================
-# FLASK
-# ============================================================
-
-app = Flask(__name__)
-
-
-# ============================================================
-# TOKENIZER
+# Tokenizer
 # ============================================================
 
 class HybridTokenizer:
-    def __init__(self, data):
-        self.word_to_id = {}
-        self.id_to_word = {}
 
-        for key in data.files:
-            if key.startswith("word_to_id_"):
-                word = key[len("word_to_id_"):]
-                self.word_to_id[word] = int(data[key])
+    def __init__(self, tokens):
 
-        for key in data.files:
-            if key.startswith("id_to_word_"):
-                idx = int(key[len("id_to_word_"):])
-                value = data[key]
+        self.tokens = list(tokens)
 
-                if isinstance(value, np.ndarray):
-                    value = value.item()
+        self.token_to_id = {
+            token: i
+            for i, token in enumerate(self.tokens)
+        }
 
-                self.id_to_word[idx] = str(value)
+        self.id_to_token = {
+            i: token
+            for i, token in enumerate(self.tokens)
+        }
 
-        self.START = self.word_to_id.get("<START>", 0)
-        self.USER = self.word_to_id.get("<USER>", 1)
-        self.ASSISTANT = self.word_to_id.get("<ASSISTANT>", 2)
-        self.END = self.word_to_id.get("<END>", 3)
-        self.UNK = self.word_to_id.get("<UNK>", 4)
+        self.vocab_size = len(self.tokens)
 
-        self.vocab_size = max(
-            len(self.word_to_id),
-            max(self.id_to_word.keys(), default=0) + 1
+        self.special_tokens = {
+            "<START>",
+            "<USER>",
+            "<ASSISTANT>",
+            "<END>",
+            "<UNK>"
+        }
+
+        self.pattern = re.compile(
+            r"<START>|<USER>|<ASSISTANT>|<END>|<UNK>|"
+            r"[A-Za-z]+(?:'[A-Za-z]+)?|"
+            r"[0-9]+(?:\.[0-9]+)?|"
+            r"\s+|"
+            r"[^A-Za-z0-9\s]"
         )
 
     def encode(self, text):
-        words = text.strip().split()
+
+        pieces = self.pattern.findall(text)
 
         result = []
 
-        for word in words:
-            result.append(
-                self.word_to_id.get(word, self.UNK)
-            )
+        for piece in pieces:
+
+            if piece in self.token_to_id:
+
+                result.append(
+                    self.token_to_id[piece]
+                )
+
+                continue
+
+            if re.fullmatch(
+                r"[A-Za-z]+(?:'[A-Za-z]+)?",
+                piece
+            ):
+
+                lower = piece.lower()
+
+                if lower in self.token_to_id:
+
+                    result.append(
+                        self.token_to_id[lower]
+                    )
+
+                    continue
+
+            for char in piece:
+
+                if char in self.token_to_id:
+
+                    result.append(
+                        self.token_to_id[char]
+                    )
+
+                else:
+
+                    result.append(
+                        self.token_to_id.get(
+                            "<UNK>",
+                            0
+                        )
+                    )
 
         return result
 
     def decode(self, ids):
-        words = []
 
-        for idx in ids:
-            idx = int(idx)
+        output = []
 
-            word = self.id_to_word.get(idx)
+        for token_id in ids:
 
-            if word is None:
+            token = self.id_to_token.get(
+                int(token_id),
+                ""
+            )
+
+            if token in self.special_tokens:
                 continue
 
-            words.append(word)
+            output.append(token)
 
-        return " ".join(words)
+        return "".join(output)
 
 
 # ============================================================
-# MODEL
+# TinyGPT inference model
 # ============================================================
 
 class TinyGPT:
 
     def __init__(self, data):
-        self.data = data
+
+        # ----------------------------------------------------
+        # Metadata
+        # ----------------------------------------------------
+
+        meta_raw = data["meta_json"]
+
+        if isinstance(meta_raw, np.ndarray):
+            meta_raw = meta_raw.item()
+
+        if isinstance(meta_raw, bytes):
+            meta_raw = meta_raw.decode("utf-8")
+
+        if isinstance(meta_raw, str):
+            self.meta = json.loads(meta_raw)
+        else:
+            self.meta = meta_raw
+
+        self.block_size = int(
+            self.meta["block_size"]
+        )
 
         self.embed_size = int(
-            data["embed_size"]
-            if "embed_size" in data
-            else 128
+            self.meta["embed_size"]
         )
 
         self.num_heads = int(
-            data["num_heads"]
-            if "num_heads" in data
-            else 4
+            self.meta["num_heads"]
         )
 
         self.num_layers = int(
-            data["num_layers"]
-            if "num_layers" in data
-            else 4
-        )
-
-        self.block_size = int(
-            data["block_size"]
-            if "block_size" in data
-            else 128
+            self.meta["num_layers"]
         )
 
         self.vocab_size = int(
-            data["vocab_size"]
-            if "vocab_size" in data
-            else 3000
+            self.meta["vocab_size"]
         )
 
-        self.head_dim = self.embed_size // self.num_heads
+        self.head_dim = (
+            self.embed_size //
+            self.num_heads
+        )
 
-        self.token_embedding = data["token_embedding"]
-        self.position_embedding = data["position_embedding"]
+        self.tokenizer = HybridTokenizer(
+            self.meta["tokens"]
+        )
 
-        self.layers = []
+        # ----------------------------------------------------
+        # Load parameters
+        # ----------------------------------------------------
 
-        for i in range(self.num_layers):
+        self.params = {}
 
-            prefix = f"layer_{i}_"
+        for key in data.files:
 
-            layer = {
-                "ln1_g": data[prefix + "ln1_g"],
-                "ln2_g": data[prefix + "ln2_g"],
+            if key.startswith("param_"):
 
-                "Wq": data[prefix + "Wq"],
-                "Wk": data[prefix + "Wk"],
-                "Wv": data[prefix + "Wv"],
-                "Wo": data[prefix + "Wo"],
+                name = key[len("param_"):]
 
-                "W1": data[prefix + "W1"],
-                "W2": data[prefix + "W2"],
-            }
+                self.params[name] = data[
+                    key
+                ].astype(
+                    np.float32,
+                    copy=False
+                )
 
-            self.layers.append(layer)
+        # ----------------------------------------------------
+        # Special tokens
+        # ----------------------------------------------------
 
-        self.final_norm_g = data["final_norm_g"]
-        self.lm_head = data["lm_head"]
+        self.start_id = (
+            self.tokenizer.token_to_id.get(
+                "<START>"
+            )
+        )
 
-    # --------------------------------------------------------
-    # RMS NORM
-    # --------------------------------------------------------
+        self.user_id = (
+            self.tokenizer.token_to_id.get(
+                "<USER>"
+            )
+        )
+
+        self.assistant_id = (
+            self.tokenizer.token_to_id.get(
+                "<ASSISTANT>"
+            )
+        )
+
+        self.end_id = (
+            self.tokenizer.token_to_id.get(
+                "<END>"
+            )
+        )
+
+        # ----------------------------------------------------
+        # Causal mask
+        # ----------------------------------------------------
+
+        self.causal_mask = np.triu(
+            np.ones(
+                (
+                    self.block_size,
+                    self.block_size
+                ),
+                dtype=bool
+            ),
+            k=1
+        )
+
+        # ----------------------------------------------------
+        # Fused QKV matrices
+        #
+        # The original model has separate Wq/Wk/Wv.
+        # We concatenate them once during startup so that
+        # every forward pass uses ONE matrix multiplication
+        # instead of three.
+        # ----------------------------------------------------
+
+        self.qkv_weights = []
+
+        for layer in range(
+            self.num_layers
+        ):
+
+            prefix = f"layer{layer}_"
+
+            Wq = self.params[
+                prefix + "Wq"
+            ]
+
+            Wk = self.params[
+                prefix + "Wk"
+            ]
+
+            Wv = self.params[
+                prefix + "Wv"
+            ]
+
+            self.qkv_weights.append(
+                np.concatenate(
+                    [
+                        Wq,
+                        Wk,
+                        Wv
+                    ],
+                    axis=1
+                )
+            )
+
+        print("TinyGPT model loaded.")
+
+        print(
+            "Vocabulary:",
+            self.vocab_size
+        )
+
+        print(
+            "Embedding:",
+            self.embed_size
+        )
+
+        print(
+            "Layers:",
+            self.num_layers
+        )
+
+        print(
+            "Heads:",
+            self.num_heads
+        )
+
+        print(
+            "Context:",
+            self.block_size
+        )
+
+        print(
+            "Parameters:",
+            len(self.params)
+        )
+
+        print(
+            "Optimizations: "
+            "fused QKV + KV cache"
+        )
+
+    # ========================================================
+    # RMSNorm
+    # ========================================================
 
     @staticmethod
-    def rms_norm(x, g, eps=1e-5):
+    def rms_norm(
+        x,
+        weight,
+        eps=1e-5
+    ):
 
-        variance = np.mean(
+        mean_square = np.mean(
             x * x,
             axis=-1,
             keepdims=True
         )
 
         return (
-            x / np.sqrt(variance + eps)
-        ) * g
+            x /
+            np.sqrt(
+                mean_square + eps
+            )
+        ) * weight
 
-    # --------------------------------------------------------
+    # ========================================================
     # GELU
-    # --------------------------------------------------------
+    # ========================================================
 
     @staticmethod
     def gelu(x):
@@ -188,85 +364,164 @@ class TinyGPT:
         return 0.5 * x * (
             1.0 +
             np.tanh(
-                np.sqrt(2.0 / np.pi) *
+                np.sqrt(2.0 / np.pi)
+                *
                 (
                     x +
                     0.044715 *
-                    np.power(x, 3)
+                    x * x * x
                 )
             )
         )
 
-    # --------------------------------------------------------
-    # FULL FORWARD
-    # --------------------------------------------------------
+    # ========================================================
+    # Prefill
+    #
+    # Processes the original prompt once and builds the
+    # K/V cache.
+    # ========================================================
 
-    def forward(self, token_ids):
+    def prefill(self, token_ids):
 
         token_ids = np.asarray(
             token_ids,
-            dtype=np.int32
+            dtype=np.int64
         )
 
-        seq_len = len(token_ids)
+        T = len(token_ids)
 
-        if seq_len > self.block_size:
-            token_ids = token_ids[-self.block_size:]
-            seq_len = len(token_ids)
+        if T > self.block_size:
 
-        x = self.token_embedding[token_ids]
+            token_ids = token_ids[
+                -self.block_size:
+            ]
 
-        positions = np.arange(
-            seq_len,
-            dtype=np.int32
+            T = self.block_size
+
+        C = self.embed_size
+
+        token_embedding = self.params[
+            "token_embedding"
+        ]
+
+        position_embedding = self.params[
+            "position_embedding"
+        ]
+
+        x = (
+            token_embedding[token_ids]
+            +
+            position_embedding[
+                np.arange(T)
+            ]
         )
 
-        x = x + self.position_embedding[positions]
+        # Each element contains the complete K/V history
+        # for one transformer layer.
 
-        for layer in self.layers:
+        cache = []
 
-            residual = x
+        for layer in range(
+            self.num_layers
+        ):
+
+            prefix = f"layer{layer}_"
+
+            # ------------------------------------------------
+            # Attention normalization
+            # ------------------------------------------------
+
+            x_residual = x
 
             h = self.rms_norm(
                 x,
-                layer["ln1_g"]
+                self.params[
+                    prefix + "norm1"
+                ]
             )
 
-            q = h @ layer["Wq"]
-            k = h @ layer["Wk"]
-            v = h @ layer["Wv"]
+            # ------------------------------------------------
+            # Fused QKV
+            # ------------------------------------------------
 
-            q = q.reshape(
-                seq_len,
+            qkv = h @ self.qkv_weights[
+                layer
+            ]
+
+            Q = qkv[
+                :, :C
+            ]
+
+            K = qkv[
+                :, C:2 * C
+            ]
+
+            V = qkv[
+                :, 2 * C:
+            ]
+
+            Q = Q.reshape(
+                T,
                 self.num_heads,
                 self.head_dim
-            ).transpose(1, 0, 2)
+            ).transpose(
+                1,
+                0,
+                2
+            )
 
-            k = k.reshape(
-                seq_len,
+            K = K.reshape(
+                T,
                 self.num_heads,
                 self.head_dim
-            ).transpose(1, 0, 2)
+            ).transpose(
+                1,
+                0,
+                2
+            )
 
-            v = v.reshape(
-                seq_len,
+            V = V.reshape(
+                T,
                 self.num_heads,
                 self.head_dim
-            ).transpose(1, 0, 2)
+            ).transpose(
+                1,
+                0,
+                2
+            )
+
+            # Save K/V for future tokens.
+
+            cache.append({
+                "k": K.copy(),
+                "v": V.copy()
+            })
+
+            # ------------------------------------------------
+            # Attention
+            # ------------------------------------------------
 
             scores = (
-                q @ k.transpose(0, 2, 1)
-            ) / np.sqrt(self.head_dim)
-
-            mask = np.triu(
-                np.ones(
-                    (seq_len, seq_len),
-                    dtype=bool
-                ),
-                k=1
+                Q @
+                K.transpose(
+                    0,
+                    2,
+                    1
+                )
+            ) / np.sqrt(
+                self.head_dim
             )
 
-            scores[:, mask] = -1e9
+            mask = self.causal_mask[
+                :T,
+                :T
+            ]
+
+            scores = np.where(
+                mask[None, :, :],
+                -1e9,
+                scores
+            )
 
             scores -= np.max(
                 scores,
@@ -274,115 +529,223 @@ class TinyGPT:
                 keepdims=True
             )
 
-            attention = np.exp(scores)
+            weights = np.exp(
+                scores
+            )
 
-            attention /= (
+            weights /= (
                 np.sum(
-                    attention,
+                    weights,
                     axis=-1,
                     keepdims=True
-                ) + 1e-9
+                )
+                + 1e-9
             )
 
-            out = attention @ v
-
-            out = out.transpose(
-                1, 0, 2
-            ).reshape(
-                seq_len,
-                self.embed_size
+            attention = (
+                weights @ V
             )
 
-            x = residual + (
-                out @ layer["Wo"]
+            attention = (
+                attention
+                .transpose(
+                    1,
+                    0,
+                    2
+                )
+                .reshape(
+                    T,
+                    C
+                )
             )
 
-            residual = x
+            x = (
+                x_residual +
+                attention @ self.params[
+                    prefix + "Wo"
+                ]
+            )
+
+            # ------------------------------------------------
+            # Feed-forward
+            # ------------------------------------------------
+
+            x_residual = x
 
             h = self.rms_norm(
                 x,
-                layer["ln2_g"]
+                self.params[
+                    prefix + "norm2"
+                ]
             )
 
-            h = self.gelu(
-                h @ layer["W1"]
+            h = (
+                h @ self.params[
+                    prefix + "W1"
+                ]
             )
 
-            x = residual + (
-                h @ layer["W2"]
+            h += self.params[
+                prefix + "b1"
+            ]
+
+            h = self.gelu(h)
+
+            h = (
+                h @ self.params[
+                    prefix + "W2"
+                ]
             )
+
+            h += self.params[
+                prefix + "b2"
+            ]
+
+            x = (
+                x_residual +
+                h
+            )
+
+        # ----------------------------------------------------
+        # Final logits
+        # ----------------------------------------------------
 
         x = self.rms_norm(
             x,
-            self.final_norm_g
+            self.params[
+                "final_norm"
+            ]
         )
 
-        logits = x @ self.lm_head
+        logits = (
+            x @ token_embedding.T
+        )
 
-        return logits
+        return logits, cache, T
 
-    # --------------------------------------------------------
-    # KV-CACHE FOR ONE TOKEN AT A TIME
-    # --------------------------------------------------------
+    # ========================================================
+    # Decode ONE new token using KV cache
+    # ========================================================
 
-    def forward_cached(self, token_id, position, cache):
+    def decode_token(
+        self,
+        token_id,
+        position,
+        cache
+    ):
 
-        token_id = int(token_id)
+        C = self.embed_size
 
-        x = self.token_embedding[
-            token_id
-        ].astype(np.float32)
-
-        x = x + self.position_embedding[
-            position
+        token_embedding = self.params[
+            "token_embedding"
         ]
 
-        x = x[None, :]
+        position_embedding = self.params[
+            "position_embedding"
+        ]
 
-        for layer_index, layer in enumerate(self.layers):
+        # ----------------------------------------------------
+        # Single-token embedding
+        # ----------------------------------------------------
 
-            residual = x
+        x = (
+            token_embedding[
+                int(token_id)
+            ]
+            +
+            position_embedding[
+                position
+            ]
+        )
+
+        x = x.reshape(
+            1,
+            C
+        )
+
+        for layer in range(
+            self.num_layers
+        ):
+
+            prefix = f"layer{layer}_"
+
+            x_residual = x
 
             h = self.rms_norm(
                 x,
-                layer["ln1_g"]
+                self.params[
+                    prefix + "norm1"
+                ]
             )
 
-            q = h @ layer["Wq"]
-            k = h @ layer["Wk"]
-            v = h @ layer["Wv"]
+            # ------------------------------------------------
+            # Fused QKV
+            # ------------------------------------------------
 
-            q = q.reshape(
+            qkv = (
+                h @
+                self.qkv_weights[
+                    layer
+                ]
+            )
+
+            Q = qkv[
+                :, :C
+            ]
+
+            K = qkv[
+                :, C:2 * C
+            ]
+
+            V = qkv[
+                :, 2 * C:
+            ]
+
+            Q = Q.reshape(
                 self.num_heads,
                 self.head_dim
             )
 
-            k = k.reshape(
+            K = K.reshape(
                 self.num_heads,
                 self.head_dim
             )
 
-            v = v.reshape(
+            V = V.reshape(
                 self.num_heads,
                 self.head_dim
             )
 
-            cache[layer_index]["k"].append(k)
-            cache[layer_index]["v"].append(v)
+            # ------------------------------------------------
+            # Append only ONE new K/V entry
+            # ------------------------------------------------
 
-            keys = np.stack(
-                cache[layer_index]["k"],
+            cache[layer]["k"] = np.concatenate(
+                [
+                    cache[layer]["k"],
+                    K[:, None, :]
+                ],
                 axis=1
             )
 
-            values = np.stack(
-                cache[layer_index]["v"],
+            cache[layer]["v"] = np.concatenate(
+                [
+                    cache[layer]["v"],
+                    V[:, None, :]
+                ],
                 axis=1
             )
+
+            keys = cache[layer]["k"]
+            values = cache[layer]["v"]
+
+            # ------------------------------------------------
+            # Attention against cached history
+            # ------------------------------------------------
 
             scores = np.einsum(
                 "hd,hnd->hn",
-                q,
+                Q,
                 keys
             )
 
@@ -396,104 +759,128 @@ class TinyGPT:
                 keepdims=True
             )
 
-            attention = np.exp(scores)
-
-            attention /= (
-                np.sum(
-                    attention,
-                    axis=-1,
-                    keepdims=True
-                ) + 1e-9
+            weights = np.exp(
+                scores
             )
 
-            out = np.einsum(
+            weights /= (
+                np.sum(
+                    weights,
+                    axis=-1,
+                    keepdims=True
+                )
+                + 1e-9
+            )
+
+            attention = np.einsum(
                 "hn,hnd->hd",
-                attention,
+                weights,
                 values
             )
 
-            out = out.reshape(
+            attention = attention.reshape(
                 1,
-                self.embed_size
+                C
             )
 
-            x = residual + (
-                out @ layer["Wo"]
+            x = (
+                x_residual +
+                attention @ self.params[
+                    prefix + "Wo"
+                ]
             )
 
-            residual = x
+            # ------------------------------------------------
+            # Feed-forward
+            # ------------------------------------------------
+
+            x_residual = x
 
             h = self.rms_norm(
                 x,
-                layer["ln2_g"]
+                self.params[
+                    prefix + "norm2"
+                ]
             )
 
-            h = self.gelu(
-                h @ layer["W1"]
+            h = (
+                h @ self.params[
+                    prefix + "W1"
+                ]
             )
 
-            x = residual + (
-                h @ layer["W2"]
+            h += self.params[
+                prefix + "b1"
+            ]
+
+            h = self.gelu(h)
+
+            h = (
+                h @ self.params[
+                    prefix + "W2"
+                ]
             )
+
+            h += self.params[
+                prefix + "b2"
+            ]
+
+            x = (
+                x_residual +
+                h
+            )
+
+        # ----------------------------------------------------
+        # Final logits
+        # ----------------------------------------------------
 
         x = self.rms_norm(
             x,
-            self.final_norm_g
+            self.params[
+                "final_norm"
+            ]
         )
 
-        logits = x @ self.lm_head
+        logits = (
+            x @ token_embedding.T
+        )
 
         return logits[0]
 
 
 # ============================================================
-# MODEL LOADING
+# Load model
 # ============================================================
 
-print("=" * 60)
-print("Loading TinyGPT...")
-print("=" * 60)
+# This is intentionally the SAME file locating method
+# from your original working server.
 
-MODEL_DATA = np.load(
-    MODEL_PATH,
+if not os.path.exists(
+    MODEL_FILE
+):
+
+    raise FileNotFoundError(
+        f"Model file not found: {MODEL_FILE}\n"
+        "Make sure tiny_gpt_pc.npz is in the repository."
+    )
+
+print(
+    f"Loading TinyGPT model from "
+    f"{MODEL_FILE}..."
+)
+
+model_data = np.load(
+    MODEL_FILE,
     allow_pickle=True
 )
 
-TOKENIZER = HybridTokenizer(
-    MODEL_DATA
+model = TinyGPT(
+    model_data
 )
-
-MODEL = TinyGPT(
-    MODEL_DATA
-)
-
-print(
-    f"Vocabulary: {TOKENIZER.vocab_size}"
-)
-
-print(
-    f"Embedding size: {MODEL.embed_size}"
-)
-
-print(
-    f"Layers: {MODEL.num_layers}"
-)
-
-print(
-    f"Heads: {MODEL.num_heads}"
-)
-
-print(
-    f"Context size: {MODEL.block_size}"
-)
-
-print("=" * 60)
-print("TinyGPT loaded successfully")
-print("=" * 60)
 
 
 # ============================================================
-# SAMPLING
+# Sampling
 # ============================================================
 
 def sample_token(
@@ -502,7 +889,8 @@ def sample_token(
     top_k,
     top_p,
     repetition_penalty,
-    generated_ids
+    generated_ids,
+    rng
 ):
 
     logits = logits.astype(
@@ -514,33 +902,49 @@ def sample_token(
     # Repetition penalty
     # --------------------------------------------------------
 
-    if repetition_penalty != 1.0:
+    if repetition_penalty > 1.0:
 
-        for token_id in set(generated_ids):
+        recent = set(
+            generated_ids[-64:]
+        )
 
-            if token_id < len(logits):
+        for token_id in recent:
+
+            if (
+                0 <= token_id
+                < len(logits)
+            ):
 
                 if logits[token_id] > 0:
-                    logits[token_id] /= repetition_penalty
+
+                    logits[token_id] /= (
+                        repetition_penalty
+                    )
+
                 else:
-                    logits[token_id] *= repetition_penalty
+
+                    logits[token_id] *= (
+                        repetition_penalty
+                    )
 
     # --------------------------------------------------------
     # Temperature
     # --------------------------------------------------------
 
-    temperature = max(
+    logits /= max(
         float(temperature),
-        1e-5
+        0.05
     )
-
-    logits /= temperature
 
     # --------------------------------------------------------
     # Top-K
     # --------------------------------------------------------
 
-    if top_k > 0 and top_k < len(logits):
+    if (
+        top_k > 0
+        and
+        top_k < len(logits)
+    ):
 
         indices = np.argpartition(
             logits,
@@ -552,7 +956,9 @@ def sample_token(
             -np.inf
         )
 
-        filtered[indices] = logits[indices]
+        filtered[indices] = (
+            logits[indices]
+        )
 
         logits = filtered
 
@@ -560,52 +966,79 @@ def sample_token(
     # Softmax
     # --------------------------------------------------------
 
-    max_logit = np.max(logits)
+    max_logit = np.max(
+        logits
+    )
 
     probabilities = np.exp(
         logits - max_logit
     )
 
-    probabilities /= (
-        np.sum(probabilities) + 1e-12
+    total = np.sum(
+        probabilities
     )
+
+    if (
+        total <= 0
+        or
+        not np.isfinite(total)
+    ):
+
+        probabilities = (
+            np.ones_like(
+                probabilities
+            )
+            /
+            len(probabilities)
+        )
+
+    else:
+
+        probabilities /= total
 
     # --------------------------------------------------------
     # Top-P
     # --------------------------------------------------------
 
-    if 0.0 < top_p < 1.0:
+    if (
+        0.0 < top_p < 1.0
+    ):
 
         sorted_indices = np.argsort(
             probabilities
         )[::-1]
 
-        sorted_probs = probabilities[
-            sorted_indices
-        ]
+        sorted_probs = (
+            probabilities[
+                sorted_indices
+            ]
+        )
 
         cumulative = np.cumsum(
             sorted_probs
         )
 
-        remove = cumulative > top_p
+        remove = (
+            cumulative > top_p
+        )
 
-        if np.any(remove):
+        if len(remove) > 0:
+            remove[0] = False
 
-            first = np.argmax(remove)
+        probabilities[
+            sorted_indices[remove]
+        ] = 0.0
 
-            remove[:first] = False
+        total = np.sum(
+            probabilities
+        )
 
-            probabilities[
-                sorted_indices[remove]
-            ] = 0.0
+        if total > 0:
 
-            probabilities /= (
-                np.sum(probabilities) + 1e-12
-            )
+            probabilities /= total
 
     return int(
-        np.random.choice(
+        rng.choice(
             len(probabilities),
             p=probabilities
         )
@@ -613,196 +1046,422 @@ def sample_token(
 
 
 # ============================================================
-# GENERATION
+# Generation
 # ============================================================
 
 def generate(
-    question,
-    max_new_tokens=60,
-    temperature=0.75,
-    top_k=30,
-    top_p=0.90,
-    repetition_penalty=1.05,
+    prompt,
+    temperature=DEFAULT_TEMPERATURE,
+    top_k=DEFAULT_TOP_K,
+    top_p=DEFAULT_TOP_P,
+    repetition_penalty=DEFAULT_REPETITION_PENALTY,
+    max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
     seed=None
 ):
 
-    if seed is not None:
-        np.random.seed(
-            int(seed)
-        )
+    tokenizer = model.tokenizer
 
     # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # TinyGPT v8 was trained on:
-    #
-    # <START>
-    # <USER> question
-    # <ASSISTANT> answer
-    # <END>
-    #
-    # It is NOT trained on a multi-turn transcript.
+    # EXACT TinyGPT v8 prompt format
     # --------------------------------------------------------
 
-    prompt_ids = [
-        TOKENIZER.START,
-        TOKENIZER.USER
-    ]
-
-    prompt_ids.extend(
-        TOKENIZER.encode(question)
+    full_prompt = (
+        "<START>\n"
+        "<USER> "
+        + prompt +
+        "\n"
+        "<ASSISTANT> "
     )
 
-    prompt_ids.append(
-        TOKENIZER.ASSISTANT
+    token_ids = tokenizer.encode(
+        full_prompt
     )
 
-    # Keep the prompt inside the model context.
+    if not token_ids:
 
-    if len(prompt_ids) >= MODEL.block_size:
+        return "", 0
 
-        prompt_ids = prompt_ids[
-            -MODEL.block_size:
+    # --------------------------------------------------------
+    # Limit prompt to model context
+    # --------------------------------------------------------
+
+    if len(token_ids) > model.block_size:
+
+        token_ids = token_ids[
+            -model.block_size:
         ]
 
-    # --------------------------------------------------------
-    # Build KV cache
-    # --------------------------------------------------------
-
-    cache = []
-
-    for _ in range(MODEL.num_layers):
-
-        cache.append({
-            "k": [],
-            "v": []
-        })
+    rng = np.random.default_rng(
+        seed
+    )
 
     # --------------------------------------------------------
-    # Process prompt once
+    # PREFILL
+    #
+    # This is the only point where the entire prompt goes
+    # through the attention mechanism.
     # --------------------------------------------------------
 
-    logits = None
-
-    for position, token_id in enumerate(prompt_ids):
-
-        logits = MODEL.forward_cached(
-            token_id,
-            position,
-            cache
+    logits, cache, prompt_length = (
+        model.prefill(
+            token_ids
         )
+    )
 
-    generated = []
+    generated_ids = []
+    answer_ids = []
 
     # --------------------------------------------------------
-    # Generate
+    # GENERATE
     # --------------------------------------------------------
 
     for _ in range(
         min(
             int(max_new_tokens),
-            MAX_ALLOWED_TOKENS
+            MAX_NEW_TOKENS_LIMIT
         )
     ):
 
-        token_id = sample_token(
-            logits,
+        next_logits = logits[-1]
+
+        next_token = sample_token(
+            next_logits,
             temperature,
             top_k,
             top_p,
             repetition_penalty,
-            generated
+            generated_ids,
+            rng
         )
 
+        # ----------------------------------------------------
         # Stop tokens
+        # ----------------------------------------------------
 
-        if token_id == TOKENIZER.END:
+        if (
+            model.end_id is not None
+            and
+            next_token == model.end_id
+        ):
             break
 
-        if token_id == TOKENIZER.USER:
+        if (
+            model.user_id is not None
+            and
+            next_token == model.user_id
+        ):
             break
 
-        if token_id == TOKENIZER.START:
+        if (
+            model.start_id is not None
+            and
+            next_token == model.start_id
+        ):
             break
 
-        if token_id == TOKENIZER.ASSISTANT:
+        if (
+            model.assistant_id is not None
+            and
+            next_token == model.assistant_id
+        ):
             break
 
-        generated.append(
-            token_id
+        generated_ids.append(
+            next_token
         )
+
+        answer_ids.append(
+            next_token
+        )
+
+        # ----------------------------------------------------
+        # Stop if context is full
+        # ----------------------------------------------------
 
         position = (
-            len(prompt_ids) +
-            len(generated) -
-            1
+            prompt_length +
+            len(generated_ids)
         )
 
-        if position >= MODEL.block_size:
+        if position >= model.block_size:
             break
 
-        logits = MODEL.forward_cached(
-            token_id,
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # Only the NEW token goes through the model.
+        # The previous K/V values remain cached.
+        # ----------------------------------------------------
+
+        logits = model.decode_token(
+            next_token,
             position,
             cache
         )
 
-    answer = TOKENIZER.decode(
-        generated
+    answer = tokenizer.decode(
+        answer_ids
     )
 
-    return answer.strip(), len(generated)
+    return (
+        answer.strip(),
+        len(answer_ids)
+    )
 
 
 # ============================================================
-# HEALTH CHECK
+# Flask
 # ============================================================
 
-@app.route("/health", methods=["GET"])
-def health():
+app = Flask(
+    __name__
+)
+
+
+# ============================================================
+# Optional API key
+# ============================================================
+
+def check_api_key():
+
+    expected = os.environ.get(
+        "API_KEY"
+    )
+
+    if not expected:
+        return True
+
+    authorization = request.headers.get(
+        "Authorization",
+        ""
+    )
+
+    if authorization.startswith(
+        "Bearer "
+    ):
+
+        supplied = authorization[
+            7:
+        ]
+
+        return supplied == expected
+
+    supplied = request.headers.get(
+        "X-API-Key",
+        ""
+    )
+
+    return supplied == expected
+
+
+# ============================================================
+# Root
+# ============================================================
+
+@app.route(
+    "/",
+    methods=["GET"]
+)
+def index():
 
     return jsonify({
-        "status": "ok",
-        "model_loaded": MODEL is not None
+
+        "name":
+            "TinyGPT API",
+
+        "status":
+            "online",
+
+        "model_loaded":
+            True,
+
+        "model_file":
+            MODEL_FILE,
+
+        "kv_cache":
+            True,
+
+        "fused_qkv":
+            True,
+
+        "endpoints": {
+
+            "GET /":
+                "API information",
+
+            "GET /health":
+                "Health check",
+
+            "GET /info":
+                "Model information",
+
+            "POST /generate":
+                "Generate TinyGPT response"
+        }
     })
 
 
 # ============================================================
-# GENERATE API
+# Health
 # ============================================================
 
-@app.route("/generate", methods=["POST"])
-def generate_endpoint():
+@app.route(
+    "/health",
+    methods=["GET"]
+)
+def health():
 
-    start_time = time.perf_counter()
+    return jsonify({
 
-    try:
+        "status":
+            "ok",
 
-        data = request.get_json(
-            silent=True
-        ) or {}
+        "model_loaded":
+            True,
 
-        prompt = data.get(
-            "prompt",
-            ""
-        )
+        "model_file":
+            MODEL_FILE,
 
-        if not isinstance(
-            prompt,
-            str
+        "kv_cache":
+            True,
+
+        "fused_qkv":
+            True
+    })
+
+
+# ============================================================
+# Info
+# ============================================================
+
+@app.route(
+    "/info",
+    methods=["GET"]
+)
+def info():
+
+    metadata = {}
+
+    for key, value in (
+        model.meta.items()
+    ):
+
+        if isinstance(
+            value,
+            np.generic
         ):
 
-            return jsonify({
-                "error": "prompt must be a string"
-            }), 400
+            value = value.item()
 
-        prompt = prompt.strip()
+        metadata[key] = value
 
-        if not prompt:
+    return jsonify({
 
-            return jsonify({
-                "error": "prompt is empty"
-            }), 400
+        "model":
+            metadata,
+
+        "server": {
+
+            "model_file":
+                MODEL_FILE,
+
+            "kv_cache":
+                True,
+
+            "fused_qkv":
+                True,
+
+            "max_prompt_chars":
+                MAX_PROMPT_CHARS,
+
+            "default_temperature":
+                DEFAULT_TEMPERATURE,
+
+            "default_top_k":
+                DEFAULT_TOP_K,
+
+            "default_top_p":
+                DEFAULT_TOP_P,
+
+            "default_repetition_penalty":
+                DEFAULT_REPETITION_PENALTY,
+
+            "default_max_new_tokens":
+                DEFAULT_MAX_NEW_TOKENS
+        }
+    })
+
+
+# ============================================================
+# Generate endpoint
+# ============================================================
+
+@app.route(
+    "/generate",
+    methods=["POST"]
+)
+def generate_endpoint():
+
+    request_start = (
+        time.perf_counter()
+    )
+
+    if not check_api_key():
+
+        return jsonify({
+            "error":
+                "Unauthorized"
+        }), 401
+
+    data = request.get_json(
+        silent=True
+    )
+
+    if not isinstance(
+        data,
+        dict
+    ):
+
+        return jsonify({
+            "error":
+                "Request body must be JSON."
+        }), 400
+
+    prompt = data.get(
+        "prompt"
+    )
+
+    if not isinstance(
+        prompt,
+        str
+    ):
+
+        return jsonify({
+            "error":
+                "'prompt' must be a string."
+        }), 400
+
+    prompt = prompt.strip()
+
+    if not prompt:
+
+        return jsonify({
+            "error":
+                "Prompt cannot be empty."
+        }), 400
+
+    if len(prompt) > MAX_PROMPT_CHARS:
+
+        return jsonify({
+            "error":
+                (
+                    "Prompt is too long. "
+                    f"Maximum is "
+                    f"{MAX_PROMPT_CHARS} characters."
+                )
+        }), 400
+
+    try:
 
         temperature = float(
             data.get(
@@ -844,85 +1503,119 @@ def generate_endpoint():
             None
         )
 
-        max_new_tokens = max(
-            1,
-            min(
-                max_new_tokens,
-                MAX_ALLOWED_TOKENS
-            )
-        )
+        if seed is not None:
 
-        temperature = max(
-            0.01,
-            min(
+            seed = int(
+                seed
+            )
+
+        # ----------------------------------------------------
+        # Clamp values
+        # ----------------------------------------------------
+
+        temperature = min(
+            max(
                 temperature,
-                2.0
-            )
+                0.05
+            ),
+            3.0
         )
 
-        top_k = max(
-            0,
-            min(
+        top_k = min(
+            max(
                 top_k,
-                TOKENIZER.vocab_size
-            )
+                0
+            ),
+            model.vocab_size
         )
 
-        top_p = max(
-            0.01,
-            min(
+        top_p = min(
+            max(
                 top_p,
-                1.0
-            )
+                0.05
+            ),
+            1.0
         )
 
-        repetition_penalty = max(
-            1.0,
-            min(
+        repetition_penalty = min(
+            max(
                 repetition_penalty,
-                2.0
-            )
+                1.0
+            ),
+            2.0
         )
 
-        # Only one generation at a time.
-        # This prevents multiple requests from
-        # competing for the small CPU/RAM available
-        # on Render Free.
+        max_new_tokens = min(
+            max(
+                max_new_tokens,
+                1
+            ),
+            MAX_NEW_TOKENS_LIMIT
+        )
+
+    except (
+        ValueError,
+        TypeError
+    ):
+
+        return jsonify({
+            "error":
+                "Invalid generation parameters."
+        }), 400
+
+    # ========================================================
+    # Generation
+    # ========================================================
+
+    try:
 
         with MODEL_LOCK:
 
-            generation_start = time.perf_counter()
+            generation_start = (
+                time.perf_counter()
+            )
 
-            answer, generated_tokens = generate(
-                question=prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                seed=seed
+            answer, generated_tokens = (
+                generate(
+                    prompt=prompt,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=
+                        repetition_penalty,
+                    max_new_tokens=
+                        max_new_tokens,
+                    seed=seed
+                )
             )
 
             generation_seconds = (
                 time.perf_counter()
-                - generation_start
+                -
+                generation_start
             )
 
         total_seconds = (
             time.perf_counter()
-            - start_time
+            -
+            request_start
         )
 
-        tokens_per_second = (
-            generated_tokens /
-            generation_seconds
-            if generation_seconds > 0
-            else 0.0
-        )
+        if generation_seconds > 0:
+
+            tokens_per_second = (
+                generated_tokens /
+                generation_seconds
+            )
+
+        else:
+
+            tokens_per_second = 0.0
 
         return jsonify({
 
-            "response": answer,
+            "response":
+                answer,
 
             "generated_tokens":
                 generated_tokens,
@@ -946,34 +1639,48 @@ def generate_endpoint():
                 ),
 
             "kv_cache_used":
-                True
+                True,
+
+            "fused_qkv":
+                True,
+
+            "model_file":
+                MODEL_FILE
         })
 
-    except Exception as e:
+    except Exception as exc:
 
         print(
             "Generation error:",
-            repr(e)
+            repr(exc)
         )
 
         return jsonify({
-            "error": str(e)
+
+            "error":
+                "Generation failed.",
+
+            "details":
+                str(exc)
+
         }), 500
 
 
 # ============================================================
-# RUN
+# Local execution
 # ============================================================
 
 if __name__ == "__main__":
 
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                5000
-            )
-        ),
+        port=port,
         threaded=False
-    )
+            )
