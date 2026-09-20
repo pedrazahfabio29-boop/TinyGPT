@@ -1,901 +1,979 @@
 import os
-
-# For small matrix-heavy CPU inference, too many BLAS threads can make a
-# low-CPU cloud instance slower because of thread-management overhead.
-# Override with TINY_GPT_THREADS if needed (for example, 2 or 4 on a stronger machine).
-_TINY_GPT_THREADS = os.environ.get("TINY_GPT_THREADS", "1")
-for _name in (
-    "OMP_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-):
-    os.environ.setdefault(_name, _TINY_GPT_THREADS)
-
-import json
-import re
-import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import threading
 
 import numpy as np
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 
 
 # ============================================================
-# Configuration
+# CONFIG
 # ============================================================
 
-MODEL_FILE = os.environ.get("MODEL_FILE", "tiny_gpt_pc.npz")
+MODEL_PATH = os.environ.get("MODEL_PATH", "model.npz")
 
-MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "8000"))
-DEFAULT_MAX_NEW_TOKENS = int(
-    os.environ.get("DEFAULT_MAX_NEW_TOKENS", "180")
-)
+DEFAULT_TEMPERATURE = 0.75
+DEFAULT_TOP_K = 30
+DEFAULT_TOP_P = 0.90
+DEFAULT_REPETITION_PENALTY = 1.05
+DEFAULT_MAX_NEW_TOKENS = 60
 
-# Keep this at 1 on the Render free plan. A single CPU is available on the
-# plan, and the model already serializes generation requests.
+MAX_ALLOWED_TOKENS = 180
+
 MODEL_LOCK = threading.Lock()
 
 
 # ============================================================
-# Tokenizer
+# FLASK
+# ============================================================
+
+app = Flask(__name__)
+
+
+# ============================================================
+# TOKENIZER
 # ============================================================
 
 class HybridTokenizer:
-    def __init__(self, tokens: Sequence[str]):
-        self.tokens = list(tokens)
-        self.token_to_id = {token: i for i, token in enumerate(self.tokens)}
-        self.id_to_token = {i: token for i, token in enumerate(self.tokens)}
-        self.vocab_size = len(self.tokens)
+    def __init__(self, data):
+        self.word_to_id = {}
+        self.id_to_word = {}
 
-        self.special_tokens = {
-            "<START>",
-            "<USER>",
-            "<ASSISTANT>",
-            "<END>",
-            "<UNK>",
-        }
+        for key in data.files:
+            if key.startswith("word_to_id_"):
+                word = key[len("word_to_id_"):]
+                self.word_to_id[word] = int(data[key])
 
-        self.pattern = re.compile(
-            r"<START>|<USER>|<ASSISTANT>|<END>|<UNK>|"
-            r"[A-Za-z]+(?:'[A-Za-z]+)?|"
-            r"[0-9]+(?:\.[0-9]+)?|"
-            r"\s+|"
-            r"[^A-Za-z0-9\s]"
+        for key in data.files:
+            if key.startswith("id_to_word_"):
+                idx = int(key[len("id_to_word_"):])
+                value = data[key]
+
+                if isinstance(value, np.ndarray):
+                    value = value.item()
+
+                self.id_to_word[idx] = str(value)
+
+        self.START = self.word_to_id.get("<START>", 0)
+        self.USER = self.word_to_id.get("<USER>", 1)
+        self.ASSISTANT = self.word_to_id.get("<ASSISTANT>", 2)
+        self.END = self.word_to_id.get("<END>", 3)
+        self.UNK = self.word_to_id.get("<UNK>", 4)
+
+        self.vocab_size = max(
+            len(self.word_to_id),
+            max(self.id_to_word.keys(), default=0) + 1
         )
 
-        # Avoid repeated regex fullmatch calls for normal words.
-        self.word_pattern = re.compile(r"^[A-Za-z]+(?:'[A-Za-z]+)?$")
+    def encode(self, text):
+        words = text.strip().split()
 
-    def encode(self, text: str) -> List[int]:
-        pieces = self.pattern.findall(text)
-        result: List[int] = []
-        append = result.append
-        token_to_id = self.token_to_id
-        unk_id = token_to_id.get("<UNK>", 0)
-        word_pattern = self.word_pattern
+        result = []
 
-        for piece in pieces:
-            # Exact token match, including special tokens, whitespace, and punctuation.
-            token_id = token_to_id.get(piece)
-            if token_id is not None:
-                append(token_id)
-                continue
-
-            # Case-normalized word match.
-            if word_pattern.fullmatch(piece):
-                lower_id = token_to_id.get(piece.lower())
-                if lower_id is not None:
-                    append(lower_id)
-                    continue
-
-            # Character fallback.
-            for char in piece:
-                append(token_to_id.get(char, unk_id))
+        for word in words:
+            result.append(
+                self.word_to_id.get(word, self.UNK)
+            )
 
         return result
 
-    def decode(self, ids: Sequence[int]) -> str:
-        id_to_token = self.id_to_token
-        specials = self.special_tokens
-        parts = []
+    def decode(self, ids):
+        words = []
 
-        for token_id in ids:
-            token = id_to_token.get(int(token_id), "")
-            if token not in specials:
-                parts.append(token)
+        for idx in ids:
+            idx = int(idx)
 
-        return "".join(parts)
+            word = self.id_to_word.get(idx)
+
+            if word is None:
+                continue
+
+            words.append(word)
+
+        return " ".join(words)
 
 
 # ============================================================
-# TinyGPT optimized inference model
+# MODEL
 # ============================================================
 
 class TinyGPT:
-    """
-    Optimized inference implementation compatible with the existing TinyGPT
-    .npz parameter format.
 
-    Main optimizations:
-      1. Fuses Wq/Wk/Wv into one QKV matrix per Transformer layer.
-      2. Uses a KV cache during autoregressive generation.
-      3. Reuses preallocated KV arrays instead of concatenating every token.
-      4. Uses in-place softmax math where practical to reduce allocations.
-      5. Uses a contiguous output projection matrix.
-      6. Only computes top-p over the top-k candidates when top_k is enabled.
-      7. Avoids rebuilding the full context until the fixed-size positional
-         context window is actually full.
-    """
+    def __init__(self, data):
+        self.data = data
 
-    def __init__(self, data: np.lib.npyio.NpzFile):
-        meta_raw: Any = data["meta_json"]
+        self.embed_size = int(
+            data["embed_size"]
+            if "embed_size" in data
+            else 128
+        )
 
-        if isinstance(meta_raw, np.ndarray):
-            meta_raw = meta_raw.item()
+        self.num_heads = int(
+            data["num_heads"]
+            if "num_heads" in data
+            else 4
+        )
 
-        if isinstance(meta_raw, bytes):
-            meta_raw = meta_raw.decode("utf-8")
+        self.num_layers = int(
+            data["num_layers"]
+            if "num_layers" in data
+            else 4
+        )
 
-        if isinstance(meta_raw, str):
-            self.meta = json.loads(meta_raw)
-        else:
-            self.meta = meta_raw
+        self.block_size = int(
+            data["block_size"]
+            if "block_size" in data
+            else 128
+        )
 
-        self.block_size = int(self.meta["block_size"])
-        self.embed_size = int(self.meta["embed_size"])
-        self.num_heads = int(self.meta["num_heads"])
-        self.num_layers = int(self.meta["num_layers"])
-        self.vocab_size = int(self.meta["vocab_size"])
-
-        if self.embed_size % self.num_heads != 0:
-            raise ValueError(
-                "embed_size must be divisible by num_heads."
-            )
+        self.vocab_size = int(
+            data["vocab_size"]
+            if "vocab_size" in data
+            else 3000
+        )
 
         self.head_dim = self.embed_size // self.num_heads
-        self.attn_scale = 1.0 / np.sqrt(self.head_dim)
 
-        tokens = self.meta["tokens"]
-        self.tokenizer = HybridTokenizer(tokens)
+        self.token_embedding = data["token_embedding"]
+        self.position_embedding = data["position_embedding"]
 
-        # ----------------------------------------------------
-        # Load parameters
-        # ----------------------------------------------------
+        self.layers = []
 
-        raw_params: Dict[str, np.ndarray] = {}
-        for key in data.files:
-            if not key.startswith("param_"):
-                continue
-            name = key[len("param_"):]
-            raw_params[name] = data[key].astype(
-                np.float32,
-                copy=False,
-            )
+        for i in range(self.num_layers):
 
-        self.params = raw_params
-
-        # Embeddings are used on every token, so keep references to them.
-        self.token_embedding = np.ascontiguousarray(
-            self.params["token_embedding"],
-            dtype=np.float32,
-        )
-        self.position_embedding = np.ascontiguousarray(
-            self.params["position_embedding"],
-            dtype=np.float32,
-        )
-
-        # Weight tying: final output projection is token_embedding.T.
-        # Make the transposed matrix contiguous once rather than paying for a
-        # strided transpose during every generated token.
-        self.output_weight = np.ascontiguousarray(
-            self.token_embedding.T,
-            dtype=np.float32,
-        )
-
-        # ----------------------------------------------------
-        # Special token IDs
-        # ----------------------------------------------------
-
-        self.start_id = self.tokenizer.token_to_id.get("<START>")
-        self.user_id = self.tokenizer.token_to_id.get("<USER>")
-        self.assistant_id = self.tokenizer.token_to_id.get("<ASSISTANT>")
-        self.end_id = self.tokenizer.token_to_id.get("<END>")
-
-        # ----------------------------------------------------
-        # Causal mask for prompt prefill only.
-        # Decode steps do not need a mask because a new token only attends
-        # to cached past tokens plus itself.
-        # ----------------------------------------------------
-
-        self.causal_mask = np.triu(
-            np.ones(
-                (self.block_size, self.block_size),
-                dtype=bool,
-            ),
-            k=1,
-        )
-
-        # ----------------------------------------------------
-        # Pre-build optimized layer records.
-        # ----------------------------------------------------
-
-        self.layers: List[Dict[str, np.ndarray]] = []
-
-        for layer_index in range(self.num_layers):
-            prefix = f"layer{layer_index}_"
-
-            # Fuse Q/K/V weights once. This replaces three matrix multiplies
-            # with one larger matrix multiply in both prefill and decode.
-            Wq = np.ascontiguousarray(
-                raw_params[prefix + "Wq"],
-                dtype=np.float32,
-            )
-            Wk = np.ascontiguousarray(
-                raw_params[prefix + "Wk"],
-                dtype=np.float32,
-            )
-            Wv = np.ascontiguousarray(
-                raw_params[prefix + "Wv"],
-                dtype=np.float32,
-            )
-
-            Wqkv = np.ascontiguousarray(
-                np.concatenate((Wq, Wk, Wv), axis=1),
-                dtype=np.float32,
-            )
+            prefix = f"layer_{i}_"
 
             layer = {
-                "norm1": np.ascontiguousarray(
-                    raw_params[prefix + "norm1"], dtype=np.float32
-                ),
-                "Wqkv": Wqkv,
-                "Wo": np.ascontiguousarray(
-                    raw_params[prefix + "Wo"], dtype=np.float32
-                ),
-                "norm2": np.ascontiguousarray(
-                    raw_params[prefix + "norm2"], dtype=np.float32
-                ),
-                "W1": np.ascontiguousarray(
-                    raw_params[prefix + "W1"], dtype=np.float32
-                ),
-                "b1": np.ascontiguousarray(
-                    raw_params[prefix + "b1"], dtype=np.float32
-                ),
-                "W2": np.ascontiguousarray(
-                    raw_params[prefix + "W2"], dtype=np.float32
-                ),
-                "b2": np.ascontiguousarray(
-                    raw_params[prefix + "b2"], dtype=np.float32
-                ),
+                "ln1_g": data[prefix + "ln1_g"],
+                "ln2_g": data[prefix + "ln2_g"],
+
+                "Wq": data[prefix + "Wq"],
+                "Wk": data[prefix + "Wk"],
+                "Wv": data[prefix + "Wv"],
+                "Wo": data[prefix + "Wo"],
+
+                "W1": data[prefix + "W1"],
+                "W2": data[prefix + "W2"],
             }
 
             self.layers.append(layer)
 
-        self.final_norm = np.ascontiguousarray(
-            raw_params["final_norm"],
-            dtype=np.float32,
-        )
-
-        self.position_ids = np.arange(
-            self.block_size,
-            dtype=np.int64,
-        )
-
-        print("TinyGPT optimized model loaded.")
-        print("Vocabulary:", self.vocab_size)
-        print("Embedding:", self.embed_size)
-        print("Layers:", self.num_layers)
-        print("Heads:", self.num_heads)
-        print("Context:", self.block_size)
-        print("Parameters:", len(self.params))
-        print("Head dimension:", self.head_dim)
-        print("KV cache: enabled")
-        print("QKV fusion: enabled")
+        self.final_norm_g = data["final_norm_g"]
+        self.lm_head = data["lm_head"]
 
     # --------------------------------------------------------
-    # RMSNorm
+    # RMS NORM
     # --------------------------------------------------------
 
     @staticmethod
-    def rms_norm(x: np.ndarray, weight: np.ndarray, eps: float = 1e-5) -> np.ndarray:
-        mean_square = np.mean(
+    def rms_norm(x, g, eps=1e-5):
+
+        variance = np.mean(
             x * x,
             axis=-1,
-            keepdims=True,
+            keepdims=True
         )
-        return (x / np.sqrt(mean_square + eps)) * weight
+
+        return (
+            x / np.sqrt(variance + eps)
+        ) * g
 
     # --------------------------------------------------------
     # GELU
     # --------------------------------------------------------
 
     @staticmethod
-    def gelu(x: np.ndarray) -> np.ndarray:
+    def gelu(x):
+
         return 0.5 * x * (
-            1.0
-            + np.tanh(
-                np.sqrt(2.0 / np.pi)
-                * (x + 0.044715 * x * x * x)
+            1.0 +
+            np.tanh(
+                np.sqrt(2.0 / np.pi) *
+                (
+                    x +
+                    0.044715 *
+                    np.power(x, 3)
+                )
             )
         )
 
     # --------------------------------------------------------
-    # Softmax helper for attention.
-    # Reuses the score array to avoid another large allocation.
+    # FULL FORWARD
     # --------------------------------------------------------
 
-    @staticmethod
-    def softmax_inplace(x: np.ndarray, axis: int = -1) -> np.ndarray:
-        x -= np.max(x, axis=axis, keepdims=True)
-        np.exp(x, out=x)
-        x /= np.sum(x, axis=axis, keepdims=True) + 1e-9
-        return x
+    def forward(self, token_ids):
 
-    # --------------------------------------------------------
-    # Allocate KV cache
-    # --------------------------------------------------------
-
-    def create_cache(self) -> Tuple[List[Dict[str, np.ndarray]], int]:
-        cache: List[Dict[str, np.ndarray]] = []
-
-        shape = (
-            self.num_heads,
-            self.block_size,
-            self.head_dim,
+        token_ids = np.asarray(
+            token_ids,
+            dtype=np.int32
         )
 
-        for _ in range(self.num_layers):
-            cache.append({
-                "k": np.empty(shape, dtype=np.float32),
-                "v": np.empty(shape, dtype=np.float32),
-            })
+        seq_len = len(token_ids)
 
-        return cache, 0
+        if seq_len > self.block_size:
+            token_ids = token_ids[-self.block_size:]
+            seq_len = len(token_ids)
 
-    # --------------------------------------------------------
-    # Full Transformer prefill
-    # --------------------------------------------------------
+        x = self.token_embedding[token_ids]
 
-    def prefill(
-        self,
-        token_ids: Sequence[int],
-    ) -> Tuple[np.ndarray, List[Dict[str, np.ndarray]], int]:
-        """Process a prompt once and populate the KV cache."""
+        positions = np.arange(
+            seq_len,
+            dtype=np.int32
+        )
 
-        if not token_ids:
-            raise ValueError("prefill() received an empty token sequence")
+        x = x + self.position_embedding[positions]
 
-        # Match the original model behavior: only the last block_size tokens
-        # participate in inference, and positions restart from zero.
-        ids = np.asarray(token_ids[-self.block_size:], dtype=np.int64)
-        T = int(ids.shape[0])
+        for layer in self.layers:
 
-        cache, cache_length = self.create_cache()
+            residual = x
 
-        x = (
-            self.token_embedding[ids]
-            + self.position_embedding[self.position_ids[:T]]
-        ).astype(np.float32, copy=False)
+            h = self.rms_norm(
+                x,
+                layer["ln1_g"]
+            )
 
-        for layer_index, layer in enumerate(self.layers):
-            h = self.rms_norm(x, layer["norm1"])
+            q = h @ layer["Wq"]
+            k = h @ layer["Wk"]
+            v = h @ layer["Wv"]
 
-            # [T, 3C] -> Q/K/V, each [H, T, D]
-            qkv = h @ layer["Wqkv"]
-            Q_flat, K_flat, V_flat = np.split(qkv, 3, axis=-1)
-
-            Q = Q_flat.reshape(
-                T, self.num_heads, self.head_dim
-            ).transpose(1, 0, 2)
-            K = K_flat.reshape(
-                T, self.num_heads, self.head_dim
-            ).transpose(1, 0, 2)
-            V = V_flat.reshape(
-                T, self.num_heads, self.head_dim
+            q = q.reshape(
+                seq_len,
+                self.num_heads,
+                self.head_dim
             ).transpose(1, 0, 2)
 
-            # Fill cache for autoregressive decode.
-            cache[layer_index]["k"][:, :T, :] = K
-            cache[layer_index]["v"][:, :T, :] = V
+            k = k.reshape(
+                seq_len,
+                self.num_heads,
+                self.head_dim
+            ).transpose(1, 0, 2)
 
-            scores = (Q @ K.transpose(0, 2, 1)) * self.attn_scale
+            v = v.reshape(
+                seq_len,
+                self.num_heads,
+                self.head_dim
+            ).transpose(1, 0, 2)
 
-            # Causal masking.
-            mask = self.causal_mask[:T, :T]
-            scores = np.where(
-                mask[None, :, :],
-                -1e9,
+            scores = (
+                q @ k.transpose(0, 2, 1)
+            ) / np.sqrt(self.head_dim)
+
+            mask = np.triu(
+                np.ones(
+                    (seq_len, seq_len),
+                    dtype=bool
+                ),
+                k=1
+            )
+
+            scores[:, mask] = -1e9
+
+            scores -= np.max(
                 scores,
+                axis=-1,
+                keepdims=True
             )
 
-            weights = self.softmax_inplace(scores, axis=-1)
-            attention = weights @ V
+            attention = np.exp(scores)
 
-            attention = attention.transpose(1, 0, 2).reshape(T, self.embed_size)
-            x = x + (attention @ layer["Wo"])
+            attention /= (
+                np.sum(
+                    attention,
+                    axis=-1,
+                    keepdims=True
+                ) + 1e-9
+            )
 
-            h = self.rms_norm(x, layer["norm2"])
-            h = h @ layer["W1"] + layer["b1"]
-            h = self.gelu(h)
-            h = h @ layer["W2"] + layer["b2"]
-            x = x + h
+            out = attention @ v
 
-        x = self.rms_norm(x, self.final_norm)
-        logits = x @ self.output_weight
+            out = out.transpose(
+                1, 0, 2
+            ).reshape(
+                seq_len,
+                self.embed_size
+            )
 
-        cache_length = T
-        return logits[-1], cache, cache_length
+            x = residual + (
+                out @ layer["Wo"]
+            )
 
-    # --------------------------------------------------------
-    # One-token cached decode step
-    # --------------------------------------------------------
+            residual = x
 
-    def decode_one(
-        self,
-        token_id: int,
-        cache: List[Dict[str, np.ndarray]],
-        cache_length: int,
-    ) -> Tuple[np.ndarray, int]:
-        """
-        Process exactly one newly generated token.
+            h = self.rms_norm(
+                x,
+                layer["ln2_g"]
+            )
 
-        No causal mask is needed: this token can attend to all cached tokens
-        and itself, and cannot see anything in the future.
-        """
+            h = self.gelu(
+                h @ layer["W1"]
+            )
 
-        if cache_length >= self.block_size:
-            raise ValueError("KV cache is full; rebuild with prefill().")
+            x = residual + (
+                h @ layer["W2"]
+            )
 
-        x = (
-            self.token_embedding[int(token_id)]
-            + self.position_embedding[cache_length]
-        ).reshape(1, self.embed_size).astype(np.float32, copy=False)
+        x = self.rms_norm(
+            x,
+            self.final_norm_g
+        )
 
-        for layer_index, layer in enumerate(self.layers):
-            h = self.rms_norm(x, layer["norm1"])
+        logits = x @ self.lm_head
 
-            qkv = h @ layer["Wqkv"]
-            Q_flat, K_flat, V_flat = np.split(qkv, 3, axis=-1)
-
-            Q = Q_flat.reshape(
-                1, self.num_heads, self.head_dim
-            ).transpose(1, 0, 2)
-            K_new = K_flat.reshape(
-                1, self.num_heads, self.head_dim
-            ).transpose(1, 0, 2)
-            V_new = V_flat.reshape(
-                1, self.num_heads, self.head_dim
-            ).transpose(1, 0, 2)
-
-            layer_cache = cache[layer_index]
-            layer_cache["k"][:, cache_length:cache_length + 1, :] = K_new
-            layer_cache["v"][:, cache_length:cache_length + 1, :] = V_new
-
-            K_all = layer_cache["k"][:, :cache_length + 1, :]
-            V_all = layer_cache["v"][:, :cache_length + 1, :]
-
-            scores = (Q @ K_all.transpose(0, 2, 1)) * self.attn_scale
-            weights = self.softmax_inplace(scores, axis=-1)
-            attention = weights @ V_all
-
-            attention = attention.transpose(1, 0, 2).reshape(1, self.embed_size)
-            x = x + (attention @ layer["Wo"])
-
-            h = self.rms_norm(x, layer["norm2"])
-            h = h @ layer["W1"] + layer["b1"]
-            h = self.gelu(h)
-            h = h @ layer["W2"] + layer["b2"]
-            x = x + h
-
-        x = self.rms_norm(x, self.final_norm)
-        logits = x @ self.output_weight
-
-        return logits[0], cache_length + 1
-
-    # --------------------------------------------------------
-    # Single-token convenience forward for compatibility/debugging
-    # --------------------------------------------------------
-
-    def forward(self, token_ids: Sequence[int]) -> np.ndarray:
-        """
-        Full forward pass retained for compatibility/debugging.
-        Generation uses prefill()+decode_one() instead.
-        """
-        ids = list(token_ids)
-        if not ids:
-            raise ValueError("forward() received an empty token sequence")
-
-        logits, _, _ = self.prefill(ids)
         return logits
 
+    # --------------------------------------------------------
+    # KV-CACHE FOR ONE TOKEN AT A TIME
+    # --------------------------------------------------------
+
+    def forward_cached(self, token_id, position, cache):
+
+        token_id = int(token_id)
+
+        x = self.token_embedding[
+            token_id
+        ].astype(np.float32)
+
+        x = x + self.position_embedding[
+            position
+        ]
+
+        x = x[None, :]
+
+        for layer_index, layer in enumerate(self.layers):
+
+            residual = x
+
+            h = self.rms_norm(
+                x,
+                layer["ln1_g"]
+            )
+
+            q = h @ layer["Wq"]
+            k = h @ layer["Wk"]
+            v = h @ layer["Wv"]
+
+            q = q.reshape(
+                self.num_heads,
+                self.head_dim
+            )
+
+            k = k.reshape(
+                self.num_heads,
+                self.head_dim
+            )
+
+            v = v.reshape(
+                self.num_heads,
+                self.head_dim
+            )
+
+            cache[layer_index]["k"].append(k)
+            cache[layer_index]["v"].append(v)
+
+            keys = np.stack(
+                cache[layer_index]["k"],
+                axis=1
+            )
+
+            values = np.stack(
+                cache[layer_index]["v"],
+                axis=1
+            )
+
+            scores = np.einsum(
+                "hd,hnd->hn",
+                q,
+                keys
+            )
+
+            scores /= np.sqrt(
+                self.head_dim
+            )
+
+            scores -= np.max(
+                scores,
+                axis=-1,
+                keepdims=True
+            )
+
+            attention = np.exp(scores)
+
+            attention /= (
+                np.sum(
+                    attention,
+                    axis=-1,
+                    keepdims=True
+                ) + 1e-9
+            )
+
+            out = np.einsum(
+                "hn,hnd->hd",
+                attention,
+                values
+            )
+
+            out = out.reshape(
+                1,
+                self.embed_size
+            )
+
+            x = residual + (
+                out @ layer["Wo"]
+            )
+
+            residual = x
+
+            h = self.rms_norm(
+                x,
+                layer["ln2_g"]
+            )
+
+            h = self.gelu(
+                h @ layer["W1"]
+            )
+
+            x = residual + (
+                h @ layer["W2"]
+            )
+
+        x = self.rms_norm(
+            x,
+            self.final_norm_g
+        )
+
+        logits = x @ self.lm_head
+
+        return logits[0]
+
 
 # ============================================================
-# Model loading
+# MODEL LOADING
 # ============================================================
 
-if not os.path.exists(MODEL_FILE):
-    raise FileNotFoundError(
-        f"Model file not found: {MODEL_FILE}\n"
-        "Make sure tiny_gpt_pc.npz is in the repository."
-    )
+print("=" * 60)
+print("Loading TinyGPT...")
+print("=" * 60)
 
-print(f"Loading TinyGPT model from {MODEL_FILE}...")
-
-model_data = np.load(
-    MODEL_FILE,
-    allow_pickle=True,
+MODEL_DATA = np.load(
+    MODEL_PATH,
+    allow_pickle=True
 )
 
-model = TinyGPT(model_data)
+TOKENIZER = HybridTokenizer(
+    MODEL_DATA
+)
+
+MODEL = TinyGPT(
+    MODEL_DATA
+)
+
+print(
+    f"Vocabulary: {TOKENIZER.vocab_size}"
+)
+
+print(
+    f"Embedding size: {MODEL.embed_size}"
+)
+
+print(
+    f"Layers: {MODEL.num_layers}"
+)
+
+print(
+    f"Heads: {MODEL.num_heads}"
+)
+
+print(
+    f"Context size: {MODEL.block_size}"
+)
+
+print("=" * 60)
+print("TinyGPT loaded successfully")
+print("=" * 60)
 
 
 # ============================================================
-# Sampling
+# SAMPLING
 # ============================================================
 
-def sample_next_token(
-    logits: np.ndarray,
-    rng: np.random.Generator,
-    temperature: float = 0.70,
-    top_k: int = 30,
-    top_p: float = 0.90,
-    repetition_penalty: float = 1.05,
-    recent_token_ids: Optional[Sequence[int]] = None,
-) -> int:
-    """
-    Fast sampling equivalent in behavior to the original backend:
-      repetition penalty -> temperature -> top-k -> softmax -> top-p -> sample
+def sample_token(
+    logits,
+    temperature,
+    top_k,
+    top_p,
+    repetition_penalty,
+    generated_ids
+):
 
-    When top_k is active, top-p is computed only over those top-k candidates,
-    which avoids sorting the entire vocabulary.
-    """
+    logits = logits.astype(
+        np.float64,
+        copy=True
+    )
 
-    logits = np.asarray(logits, dtype=np.float32).copy()
+    # --------------------------------------------------------
+    # Repetition penalty
+    # --------------------------------------------------------
 
-    # Repetition penalty.
-    if repetition_penalty > 1.0 and recent_token_ids:
-        recent = set(int(x) for x in recent_token_ids)
-        vocab_size = logits.shape[0]
+    if repetition_penalty != 1.0:
 
-        for token_id in recent:
-            if 0 <= token_id < vocab_size:
-                if logits[token_id] > 0.0:
+        for token_id in set(generated_ids):
+
+            if token_id < len(logits):
+
+                if logits[token_id] > 0:
                     logits[token_id] /= repetition_penalty
                 else:
                     logits[token_id] *= repetition_penalty
 
-    temperature = max(float(temperature), 1e-5)
+    # --------------------------------------------------------
+    # Temperature
+    # --------------------------------------------------------
+
+    temperature = max(
+        float(temperature),
+        1e-5
+    )
+
     logits /= temperature
 
-    vocab_size = logits.shape[0]
-
     # --------------------------------------------------------
-    # Top-k first.
+    # Top-K
     # --------------------------------------------------------
 
-    if 0 < top_k < vocab_size:
-        candidate_ids = np.argpartition(
+    if top_k > 0 and top_k < len(logits):
+
+        indices = np.argpartition(
             logits,
-            -top_k,
+            -top_k
         )[-top_k:]
 
-        candidate_logits = logits[candidate_ids]
-    else:
-        candidate_ids = np.arange(vocab_size, dtype=np.int64)
-        candidate_logits = logits
-
-    # --------------------------------------------------------
-    # Stable softmax over candidates only.
-    # --------------------------------------------------------
-
-    candidate_logits = candidate_logits - np.max(candidate_logits)
-    probabilities = np.exp(candidate_logits)
-    total = float(np.sum(probabilities))
-
-    if total <= 0.0 or not np.isfinite(total):
-        probabilities = np.full(
-            probabilities.shape,
-            1.0 / len(probabilities),
-            dtype=np.float32,
+        filtered = np.full_like(
+            logits,
+            -np.inf
         )
-    else:
-        probabilities /= total
+
+        filtered[indices] = logits[indices]
+
+        logits = filtered
 
     # --------------------------------------------------------
-    # Top-p.
+    # Softmax
     # --------------------------------------------------------
 
-    if top_p < 1.0 and len(probabilities) > 1:
-        order = np.argsort(probabilities)[::-1]
-        sorted_probs = probabilities[order]
-        cumulative = np.cumsum(sorted_probs)
+    max_logit = np.max(logits)
+
+    probabilities = np.exp(
+        logits - max_logit
+    )
+
+    probabilities /= (
+        np.sum(probabilities) + 1e-12
+    )
+
+    # --------------------------------------------------------
+    # Top-P
+    # --------------------------------------------------------
+
+    if 0.0 < top_p < 1.0:
+
+        sorted_indices = np.argsort(
+            probabilities
+        )[::-1]
+
+        sorted_probs = probabilities[
+            sorted_indices
+        ]
+
+        cumulative = np.cumsum(
+            sorted_probs
+        )
 
         remove = cumulative > top_p
-        remove[0] = False
 
-        probabilities[order[remove]] = 0.0
+        if np.any(remove):
 
-        total = float(np.sum(probabilities))
-        if total > 0.0:
-            probabilities /= total
+            first = np.argmax(remove)
 
-    chosen_index = int(
-        rng.choice(
-            len(candidate_ids),
-            p=probabilities,
+            remove[:first] = False
+
+            probabilities[
+                sorted_indices[remove]
+            ] = 0.0
+
+            probabilities /= (
+                np.sum(probabilities) + 1e-12
+            )
+
+    return int(
+        np.random.choice(
+            len(probabilities),
+            p=probabilities
         )
     )
 
-    return int(candidate_ids[chosen_index])
-
 
 # ============================================================
-# Generation
+# GENERATION
 # ============================================================
 
 def generate(
-    prompt: str,
-    temperature: float = 0.70,
-    top_k: int = 30,
-    top_p: float = 0.90,
-    repetition_penalty: float = 1.05,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-    seed: Optional[int] = None,
-) -> Tuple[str, int, float, bool]:
-    """
-    Return:
-      answer, generated_token_count, generation_time_seconds, kv_cache_used
-    """
+    question,
+    max_new_tokens=60,
+    temperature=0.75,
+    top_k=30,
+    top_p=0.90,
+    repetition_penalty=1.05,
+    seed=None
+):
 
-    tokenizer = model.tokenizer
-
-    full_prompt = (
-        "<START>\n"
-        "<USER> "
-        + prompt
-        + "\n"
-        "<ASSISTANT> "
-    )
-
-    prompt_ids = tokenizer.encode(full_prompt)
-    if not prompt_ids:
-        return "", 0, 0.0, False
-
-    generated = list(prompt_ids)
-    rng = np.random.default_rng(seed)
-
-    start_time = time.perf_counter()
-
-    # One full prompt pass; subsequent tokens use cached K/V.
-    logits, cache, cache_length = model.prefill(generated)
-    kv_cache_used = True
-    generated_count = 0
-
-    for _ in range(max_new_tokens):
-        next_token = sample_next_token(
-            logits,
-            rng=rng,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            recent_token_ids=generated[-64:],
+    if seed is not None:
+        np.random.seed(
+            int(seed)
         )
 
-        generated.append(next_token)
-        generated_count += 1
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # TinyGPT v8 was trained on:
+    #
+    # <START>
+    # <USER> question
+    # <ASSISTANT> answer
+    # <END>
+    #
+    # It is NOT trained on a multi-turn transcript.
+    # --------------------------------------------------------
 
-        if model.end_id is not None and next_token == model.end_id:
+    prompt_ids = [
+        TOKENIZER.START,
+        TOKENIZER.USER
+    ]
+
+    prompt_ids.extend(
+        TOKENIZER.encode(question)
+    )
+
+    prompt_ids.append(
+        TOKENIZER.ASSISTANT
+    )
+
+    # Keep the prompt inside the model context.
+
+    if len(prompt_ids) >= MODEL.block_size:
+
+        prompt_ids = prompt_ids[
+            -MODEL.block_size:
+        ]
+
+    # --------------------------------------------------------
+    # Build KV cache
+    # --------------------------------------------------------
+
+    cache = []
+
+    for _ in range(MODEL.num_layers):
+
+        cache.append({
+            "k": [],
+            "v": []
+        })
+
+    # --------------------------------------------------------
+    # Process prompt once
+    # --------------------------------------------------------
+
+    logits = None
+
+    for position, token_id in enumerate(prompt_ids):
+
+        logits = MODEL.forward_cached(
+            token_id,
+            position,
+            cache
+        )
+
+    generated = []
+
+    # --------------------------------------------------------
+    # Generate
+    # --------------------------------------------------------
+
+    for _ in range(
+        min(
+            int(max_new_tokens),
+            MAX_ALLOWED_TOKENS
+        )
+    ):
+
+        token_id = sample_token(
+            logits,
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            generated
+        )
+
+        # Stop tokens
+
+        if token_id == TOKENIZER.END:
             break
 
-        # If there is room in the fixed positional context, decode the new
-        # token incrementally using the existing cache.
-        if cache_length < model.block_size:
-            logits, cache_length = model.decode_one(
-                next_token,
-                cache,
-                cache_length,
-            )
-        else:
-            # The original model discards the oldest token and resets the
-            # position IDs when context exceeds block_size. To preserve that
-            # exact behavior, rebuild the cache from the new sliding window.
-            logits, cache, cache_length = model.prefill(
-                generated[-model.block_size:]
-            )
+        if token_id == TOKENIZER.USER:
+            break
 
-    elapsed = max(time.perf_counter() - start_time, 1e-9)
+        if token_id == TOKENIZER.START:
+            break
 
-    # Decode only the generated answer.
-    answer = tokenizer.decode(generated)
+        if token_id == TOKENIZER.ASSISTANT:
+            break
 
-    marker = "<ASSISTANT>"
-    if marker in answer:
-        answer = answer.split(marker, 1)[1]
+        generated.append(
+            token_id
+        )
 
-    if "<USER>" in answer:
-        answer = answer.split("<USER>", 1)[0]
+        position = (
+            len(prompt_ids) +
+            len(generated) -
+            1
+        )
 
-    if "<END>" in answer:
-        answer = answer.split("<END>", 1)[0]
+        if position >= MODEL.block_size:
+            break
 
-    return answer.strip(), generated_count, elapsed, kv_cache_used
+        logits = MODEL.forward_cached(
+            token_id,
+            position,
+            cache
+        )
+
+    answer = TOKENIZER.decode(
+        generated
+    )
+
+    return answer.strip(), len(generated)
 
 
 # ============================================================
-# Flask API
+# HEALTH CHECK
 # ============================================================
-
-app = Flask(__name__)
-
-
-def check_api_key() -> bool:
-    expected = os.environ.get("API_KEY")
-
-    # If no API key is configured, the API is public.
-    if not expected:
-        return True
-
-    authorization = request.headers.get("Authorization", "")
-
-    if authorization.startswith("Bearer "):
-        supplied = authorization[len("Bearer "):]
-        if supplied == expected:
-            return True
-
-    supplied = request.headers.get("X-API-Key", "")
-    return supplied == expected
-
-
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({
-        "name": "TinyGPT API",
-        "status": "online",
-        "model_loaded": True,
-        "optimized_inference": True,
-        "kv_cache": True,
-        "qkv_fusion": True,
-        "endpoints": {
-            "GET /": "API information",
-            "GET /health": "Health check",
-            "GET /info": "Model information",
-            "POST /generate": "Generate a TinyGPT response",
-        },
-    })
-
 
 @app.route("/health", methods=["GET"])
 def health():
+
     return jsonify({
         "status": "ok",
-        "model_loaded": True,
+        "model_loaded": MODEL is not None
     })
 
 
-@app.route("/info", methods=["GET"])
-def info():
-    metadata = {}
-
-    for key, value in model.meta.items():
-        if isinstance(value, np.generic):
-            value = value.item()
-        metadata[key] = value
-
-    return jsonify({
-        "model": metadata,
-        "server": {
-            "max_prompt_chars": MAX_PROMPT_CHARS,
-            "default_max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
-            "optimized_inference": True,
-            "kv_cache": True,
-            "qkv_fusion": True,
-            "blas_threads": _TINY_GPT_THREADS,
-        },
-    })
-
+# ============================================================
+# GENERATE API
+# ============================================================
 
 @app.route("/generate", methods=["POST"])
 def generate_endpoint():
-    if not check_api_key():
-        return jsonify({"error": "Unauthorized"}), 401
 
-    data = request.get_json(silent=True)
+    start_time = time.perf_counter()
 
-    if not isinstance(data, dict):
-        return jsonify({"error": "Request body must be JSON."}), 400
+    try:
 
-    prompt = data.get("prompt")
+        data = request.get_json(
+            silent=True
+        ) or {}
 
-    if not isinstance(prompt, str):
-        return jsonify({"error": "'prompt' must be a string."}), 400
+        prompt = data.get(
+            "prompt",
+            ""
+        )
 
-    prompt = prompt.strip()
+        if not isinstance(
+            prompt,
+            str
+        ):
 
-    if not prompt:
-        return jsonify({"error": "Prompt cannot be empty."}), 400
+            return jsonify({
+                "error": "prompt must be a string"
+            }), 400
 
-    if len(prompt) > MAX_PROMPT_CHARS:
-        return jsonify({
-            "error": (
-                f"Prompt is too long. Maximum is {MAX_PROMPT_CHARS} characters."
+        prompt = prompt.strip()
+
+        if not prompt:
+
+            return jsonify({
+                "error": "prompt is empty"
+            }), 400
+
+        temperature = float(
+            data.get(
+                "temperature",
+                DEFAULT_TEMPERATURE
             )
-        }), 400
+        )
 
-    try:
-        temperature = float(data.get("temperature", 0.70))
-        top_k = int(data.get("top_k", 30))
-        top_p = float(data.get("top_p", 0.90))
+        top_k = int(
+            data.get(
+                "top_k",
+                DEFAULT_TOP_K
+            )
+        )
+
+        top_p = float(
+            data.get(
+                "top_p",
+                DEFAULT_TOP_P
+            )
+        )
+
         repetition_penalty = float(
-            data.get("repetition_penalty", 1.05)
+            data.get(
+                "repetition_penalty",
+                DEFAULT_REPETITION_PENALTY
+            )
         )
+
         max_new_tokens = int(
-            data.get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS)
+            data.get(
+                "max_new_tokens",
+                DEFAULT_MAX_NEW_TOKENS
+            )
         )
 
-        seed = data.get("seed", None)
-        if seed is not None:
-            seed = int(seed)
+        seed = data.get(
+            "seed",
+            None
+        )
 
-        # Safety / validity limits.
-        temperature = min(max(temperature, 0.05), 3.0)
-        top_k = min(max(top_k, 0), model.vocab_size)
-        top_p = min(max(top_p, 0.05), 1.0)
-        repetition_penalty = min(max(repetition_penalty, 1.0), 2.0)
-        max_new_tokens = min(max(max_new_tokens, 1), 180)
+        max_new_tokens = max(
+            1,
+            min(
+                max_new_tokens,
+                MAX_ALLOWED_TOKENS
+            )
+        )
 
-    except (ValueError, TypeError):
-        return jsonify({
-            "error": "Invalid generation parameters."
-        }), 400
+        temperature = max(
+            0.01,
+            min(
+                temperature,
+                2.0
+            )
+        )
 
-    try:
-        # Serialize CPU-heavy generation so concurrent requests do not
-        # compete for the small free CPU allocation.
+        top_k = max(
+            0,
+            min(
+                top_k,
+                TOKENIZER.vocab_size
+            )
+        )
+
+        top_p = max(
+            0.01,
+            min(
+                top_p,
+                1.0
+            )
+        )
+
+        repetition_penalty = max(
+            1.0,
+            min(
+                repetition_penalty,
+                2.0
+            )
+        )
+
+        # Only one generation at a time.
+        # This prevents multiple requests from
+        # competing for the small CPU/RAM available
+        # on Render Free.
+
         with MODEL_LOCK:
-            answer, token_count, elapsed, kv_cache_used = generate(
-                prompt=prompt,
+
+            generation_start = time.perf_counter()
+
+            answer, generated_tokens = generate(
+                question=prompt,
+                max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
-                max_new_tokens=max_new_tokens,
-                seed=seed,
+                seed=seed
             )
 
-        tokens_per_second = token_count / elapsed if elapsed > 0 else 0.0
+            generation_seconds = (
+                time.perf_counter()
+                - generation_start
+            )
+
+        total_seconds = (
+            time.perf_counter()
+            - start_time
+        )
+
+        tokens_per_second = (
+            generated_tokens /
+            generation_seconds
+            if generation_seconds > 0
+            else 0.0
+        )
 
         return jsonify({
-            "prompt": prompt,
+
             "response": answer,
-            "generated_tokens": token_count,
-            "generation_seconds": round(elapsed, 4),
-            "tokens_per_second": round(tokens_per_second, 3),
-            "kv_cache_used": kv_cache_used,
+
+            "generated_tokens":
+                generated_tokens,
+
+            "generation_seconds":
+                round(
+                    generation_seconds,
+                    4
+                ),
+
+            "tokens_per_second":
+                round(
+                    tokens_per_second,
+                    2
+                ),
+
+            "total_seconds":
+                round(
+                    total_seconds,
+                    4
+                ),
+
+            "kv_cache_used":
+                True
         })
 
-    except Exception as exc:
-        print("Generation error:", repr(exc))
+    except Exception as e:
+
+        print(
+            "Generation error:",
+            repr(e)
+        )
+
         return jsonify({
-            "error": "Generation failed.",
-            "details": str(exc),
+            "error": str(e)
         }), 500
 
 
 # ============================================================
-# Local execution
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
 
-    # Flask's development server is useful for local testing.
-    # On Render, use Gunicorn as the start command instead.
     app.run(
         host="0.0.0.0",
-        port=port,
-        debug=False,
-        threaded=True,
+        port=int(
+            os.environ.get(
+                "PORT",
+                5000
+            )
+        ),
+        threaded=False
     )
